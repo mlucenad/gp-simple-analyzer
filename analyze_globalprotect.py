@@ -54,6 +54,12 @@ from collections import Counter, defaultdict
 CONSOLIDATED_CSV = "consolidated_sessions.csv"
 SUMMARY_HTML = "summary.html"
 
+# Default cap on input rows. Above this, load_csvs aborts to protect
+# against accidental or malicious huge inputs (the per-user O(n^2)
+# overlap rules degrade badly past a few hundred thousand rows). Override
+# with --max-rows. Use 0 to disable the cap entirely.
+DEFAULT_MAX_ROWS = 1_000_000
+
 # Baseline = the user's "home" region (used by R18 to flag new users whose
 # first activity comes from somewhere other than the org's normal location).
 # Default is auto-detected from the data (most common ISO-2 region). The user
@@ -371,12 +377,18 @@ def detect_anchor_from_filename(filename):
         return None
 
 
-def load_csvs(input_dir, anchor_override, logger):
+def load_csvs(input_dir, anchor_override, logger, max_rows=None):
     """Read every CSV in ``input_dir``; return ``(sessions, parse_errors)``.
 
     Each session is a dict with the original CSV columns plus internal
     underscore-prefixed fields used by analysis (datetimes, flags). Year is
     inferred from the filename anchor (or from ``anchor_override`` when set).
+
+    If ``max_rows`` is set and the cumulative number of accepted session
+    rows exceeds that cap, loading aborts with ``SystemExit``. This is a
+    safety net against accidentally pointing the tool at a directory with
+    far more data than the per-user O(n^2) rules can analyze in
+    reasonable time. Pass ``None`` (or 0) to disable the cap.
     """
     pattern = os.path.join(input_dir, "*.csv")
     consolidated_stem = os.path.splitext(CONSOLIDATED_CSV)[0]
@@ -490,6 +502,13 @@ def load_csvs(input_dir, anchor_override, logger):
                     "_ongoing": ongoing,
                     "_corrupt": corrupt,
                 })
+
+                if max_rows and len(sessions) > max_rows:
+                    raise SystemExit(
+                        "Aborting: more than {0} session rows loaded. "
+                        "Raise --max-rows (or pass --max-rows 0 to "
+                        "disable the cap) if this is intentional.".format(
+                            max_rows))
 
     deduped = dedupe_sessions(sessions)
     deduped.sort(key=lambda r: (r["_login_dt"], r.get("Logout At") or ""))
@@ -2757,19 +2776,45 @@ def archive_existing(path, logger=None):
     stamp unambiguous when archives are shared across timezones (relevant
     for incident-response forensics). No-op if the file does not exist.
     Returns the new path on success, or None.
+
+    The target name is claimed atomically with O_CREAT|O_EXCL, so two
+    concurrent runs in the same directory cannot silently overwrite each
+    other's archives even when their mtime stamps collide.
     """
-    if not os.path.exists(path):
+    try:
+        mtime_secs = os.path.getmtime(path)
+    except FileNotFoundError:
         return None
-    mtime = dt.datetime.utcfromtimestamp(os.path.getmtime(path))
+    mtime = dt.datetime.utcfromtimestamp(mtime_secs)
     stem, ext = os.path.splitext(path)
     stamp = mtime.strftime("%Y%m%dT%H%M%SZ")
-    target = "{0}.{1}{2}".format(stem, stamp, ext)
-    # Disambiguate on the off chance the stamped path already exists
-    # (e.g. two runs in the same second on a 1s-resolution filesystem).
-    counter = 1
-    while os.path.exists(target):
-        target = "{0}.{1}_{2}{3}".format(stem, stamp, counter, ext)
-        counter += 1
+
+    # Atomically claim a unique archive name. Each iteration tries to
+    # create the file with O_CREAT|O_EXCL: that operation is atomic on
+    # POSIX and Windows, so only one concurrent caller can ever succeed
+    # for a given name. If the name is taken, append a counter and
+    # retry. The cap of 1000 prevents an infinite loop if the directory
+    # somehow already contains every variant.
+    counter = 0
+    target = None
+    while counter < 1000:
+        candidate = ("{0}.{1}{2}".format(stem, stamp, ext) if counter == 0
+                     else "{0}.{1}_{2}{3}".format(stem, stamp, counter, ext))
+        try:
+            fd = os.open(candidate,
+                         os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            counter += 1
+            continue
+        os.close(fd)
+        target = candidate
+        break
+    if target is None:
+        raise RuntimeError(
+            "Could not find a unique archive name for {0!r}".format(path))
+
+    # Replace the placeholder with the real source. os.replace is atomic
+    # on POSIX and on Windows when source and target share a volume.
     os.replace(path, target)
     if logger:
         logger.info("Archived %s -> %s.", path, target)
@@ -2812,13 +2857,18 @@ def main(argv=None):
     p.add_argument("--no-archive", action="store_true",
                    help="Overwrite existing outputs instead of archiving them "
                         "with a timestamp suffix.")
+    p.add_argument("--max-rows", type=int, default=DEFAULT_MAX_ROWS,
+                   help="Abort if input contains more than this many session "
+                        "rows (default: {0}). Pass 0 to disable.".format(
+                            DEFAULT_MAX_ROWS))
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args(argv)
 
     logger = setup_logger(args.verbose)
     out_dir = args.output_dir or args.input_dir
 
-    sessions, errors = load_csvs(args.input_dir, args.anchor_date, logger)
+    sessions, errors = load_csvs(args.input_dir, args.anchor_date, logger,
+                                  max_rows=args.max_rows or None)
     logger.info("Loaded %d session(s), %d parse error(s).", len(sessions), len(errors))
 
     baseline_region = args.baseline_region

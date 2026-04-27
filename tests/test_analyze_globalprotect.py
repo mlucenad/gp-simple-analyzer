@@ -551,6 +551,44 @@ class TestPipelineEndToEnd(unittest.TestCase):
         self.assertEqual(ongoing[0]["Lifetime (S)"], "28800")
 
 
+class TestMaxRowsCap(unittest.TestCase):
+    """The --max-rows safety net should abort on huge inputs."""
+
+    def test_exceeding_cap_aborts(self):
+        with tempfile.TemporaryDirectory() as td:
+            f = make_filename(td, "04272026")
+            rows = [
+                ["c", "u{0}".format(i), "c\\u{0}".format(i),
+                 "PC{0}".format(i), "Win",
+                 "10.0.0.{0}".format(i), "1.1.1.{0}".format(i),
+                 "ES", "SSL",
+                 "Apr.27 08:00:00", "Apr.27 09:00:00"]
+                for i in range(5)]
+            write_csv(f, LOGOUT_HEADER, rows)
+            with self.assertRaises(SystemExit):
+                gp.load_csvs(td, dt.date(2026, 4, 27), _silent_logger(),
+                             max_rows=2)
+
+    def test_cap_disabled_with_zero_or_none(self):
+        # Both 0 and None should disable the cap and load everything.
+        with tempfile.TemporaryDirectory() as td:
+            f = make_filename(td, "04272026")
+            rows = [
+                ["c", "u{0}".format(i), "c\\u{0}".format(i),
+                 "PC{0}".format(i), "Win",
+                 "10.0.0.{0}".format(i), "1.1.1.{0}".format(i),
+                 "ES", "SSL",
+                 "Apr.27 08:00:00", "Apr.27 09:00:00"]
+                for i in range(5)]
+            write_csv(f, LOGOUT_HEADER, rows)
+            for cap in (None, 0):
+                sessions, errors = gp.load_csvs(
+                    td, dt.date(2026, 4, 27), _silent_logger(),
+                    max_rows=cap)
+                self.assertEqual(len(sessions), 5)
+                self.assertEqual(errors, [])
+
+
 class TestBaselineDetection(unittest.TestCase):
     """Baseline region must auto-detect from data, not be hardcoded to ES."""
 
@@ -720,6 +758,39 @@ class TestArchiveExisting(unittest.TestCase):
                     "consolidated_sessions.{0}.csv".format(stamp))))
             self.assertTrue(os.path.exists(
                 os.path.join(td, "summary.{0}.html".format(stamp))))
+
+    def test_archive_does_not_overwrite_a_pre_existing_stamped_file(self):
+        """Regression for the TOCTOU window: even if the disambiguated
+        target name appears between the existence check and the rename,
+        the atomic O_CREAT|O_EXCL claim prevents data loss."""
+        with tempfile.TemporaryDirectory() as td:
+            ts = dt.datetime(2026, 4, 27, 12, 30, 12).timestamp()
+            stamp = dt.datetime.utcfromtimestamp(ts).strftime(
+                "%Y%m%dT%H%M%SZ")
+            target = os.path.join(td, "summary.html")
+            with open(target, "w") as fh:
+                fh.write("source-content")
+            os.utime(target, (ts, ts))
+            # Pre-create the canonical stamped name AND the _1 variant
+            # to force the loop to land on _2.
+            for name in ("summary.{0}.html".format(stamp),
+                         "summary.{0}_1.html".format(stamp)):
+                with open(os.path.join(td, name), "w") as fh:
+                    fh.write("must-not-be-overwritten:" + name)
+
+            new_path = gp.archive_existing(target)
+            self.assertEqual(
+                new_path,
+                os.path.join(td, "summary.{0}_2.html".format(stamp)))
+            # Pre-existing files were preserved
+            for name in ("summary.{0}.html".format(stamp),
+                         "summary.{0}_1.html".format(stamp)):
+                with open(os.path.join(td, name)) as fh:
+                    self.assertTrue(fh.read().startswith(
+                        "must-not-be-overwritten:"))
+            # Source content ended up at the new path
+            with open(new_path) as fh:
+                self.assertEqual(fh.read(), "source-content")
 
     def test_archived_consolidated_is_not_loaded_as_input(self):
         """Regression: archived consolidated CSVs share the consolidated schema,

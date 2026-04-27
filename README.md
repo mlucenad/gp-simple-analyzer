@@ -186,6 +186,9 @@ Options:
   --no-html              Skip HTML output.
   --no-csv               Skip consolidated CSV output.
   --no-archive           Overwrite existing outputs instead of timestamp-archiving them.
+  --max-rows N           Abort if input has more than N session rows (default: 1000000).
+                         Pass 0 to disable. Acts as a safety net against huge or
+                         hostile CSV inputs that would degrade the O(n^2) rules.
   -v, --verbose          Verbose logging.
 ```
 
