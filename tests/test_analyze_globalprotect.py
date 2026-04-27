@@ -500,6 +500,37 @@ class TestPipelineEndToEnd(unittest.TestCase):
         self.assertEqual(data["meta"]["finding_count"], len(findings))
         self.assertIn("alice", data["users"])
 
+    def test_consolidated_csv_neutralizes_formula_injection(self):
+        """Regression: cells starting with =, +, -, @, tab, or CR must be
+        prefixed with a single quote so spreadsheet apps don't evaluate
+        them as formulas / DDE payloads."""
+        with tempfile.TemporaryDirectory() as td:
+            sessions = [{
+                "_id": "x", "_file": "f.csv",
+                "Domain": "cnio", "User": "=cmd|'/c calc'!A1",
+                "Primary Username": "cnio\\u",
+                "Computer": "+evil", "Client": "-payload",
+                "Private IP": "10.0.0.1", "Public IP": "1.1.1.1",
+                "Source Region": "@malicious", "Tunnel Type": "SSL",
+                "Login At": "2026-04-27 08:00:00",
+                "Logout At": "2026-04-27 09:00:00",
+                "Status": "closed", "Lifetime (S)": "3600",
+            }]
+            out = os.path.join(td, gp.CONSOLIDATED_CSV)
+            gp.write_consolidated_csv(out, sessions)
+            with open(out, encoding="utf-8") as fh:
+                rows = list(csv.DictReader(fh))
+            self.assertEqual(len(rows), 1)
+            r = rows[0]
+            self.assertTrue(r["User"].startswith("'="),
+                msg="formula-leading User must be quoted: {0!r}".format(r["User"]))
+            self.assertTrue(r["Computer"].startswith("'+"))
+            self.assertTrue(r["Client"].startswith("'-"))
+            self.assertTrue(r["Source Region"].startswith("'@"))
+            # Benign cells must not be touched
+            self.assertEqual(r["Domain"], "cnio")
+            self.assertEqual(r["Public IP"], "1.1.1.1")
+
     def test_consolidated_csv_columns_and_rows(self):
         self._build_basic_dataset()
         sessions, _ = gp.load_csvs(
@@ -610,14 +641,19 @@ class TestArchiveExisting(unittest.TestCase):
             target = os.path.join(td, "summary.html")
             with open(target, "w") as fh:
                 fh.write("old")
-            # Pin mtime to a known value so the assertion is deterministic
+            # Pin mtime to a known value so the assertion is deterministic.
+            # archive_existing formats the stamp from the UTC of mtime, so
+            # we compute the expected stamp the same way to stay
+            # timezone-independent.
             ts = dt.datetime(2026, 4, 27, 12, 30, 12).timestamp()
             os.utime(target, (ts, ts))
+            stamp = dt.datetime.utcfromtimestamp(ts).strftime(
+                "%Y%m%dT%H%M%SZ")
 
             new_path = gp.archive_existing(target)
             self.assertIsNotNone(new_path)
             self.assertFalse(os.path.exists(target))
-            expected = os.path.join(td, "summary.20260427T123012.html")
+            expected = os.path.join(td, "summary.{0}.html".format(stamp))
             self.assertEqual(new_path, expected)
             self.assertTrue(os.path.exists(expected))
             with open(expected) as fh:
@@ -625,19 +661,23 @@ class TestArchiveExisting(unittest.TestCase):
 
     def test_disambiguates_on_collision(self):
         with tempfile.TemporaryDirectory() as td:
+            ts = dt.datetime(2026, 4, 27, 12, 30, 12).timestamp()
+            stamp = dt.datetime.utcfromtimestamp(ts).strftime(
+                "%Y%m%dT%H%M%SZ")
             target = os.path.join(td, "consolidated_sessions.csv")
-            stamped = os.path.join(td, "consolidated_sessions.20260427T123012.csv")
+            stamped = os.path.join(td,
+                "consolidated_sessions.{0}.csv".format(stamp))
             with open(target, "w") as fh:
                 fh.write("now")
             with open(stamped, "w") as fh:
                 fh.write("preexisting")
-            ts = dt.datetime(2026, 4, 27, 12, 30, 12).timestamp()
             os.utime(target, (ts, ts))
 
             new_path = gp.archive_existing(target)
             self.assertEqual(
                 new_path,
-                os.path.join(td, "consolidated_sessions.20260427T123012_1.csv"))
+                os.path.join(td,
+                    "consolidated_sessions.{0}_1.csv".format(stamp)))
             self.assertFalse(os.path.exists(target))
             with open(stamped) as fh:
                 self.assertEqual(fh.read(), "preexisting")
@@ -667,6 +707,8 @@ class TestArchiveExisting(unittest.TestCase):
             ts = dt.datetime(2026, 4, 27, 12, 30, 12).timestamp()
             os.utime(csv_path, (ts, ts))
             os.utime(html_path, (ts, ts))
+            stamp = dt.datetime.utcfromtimestamp(ts).strftime(
+                "%Y%m%dT%H%M%SZ")
 
             # Second run
             with contextlib.redirect_stderr(io.StringIO()):
@@ -674,9 +716,10 @@ class TestArchiveExisting(unittest.TestCase):
             self.assertTrue(os.path.exists(csv_path))
             self.assertTrue(os.path.exists(html_path))
             self.assertTrue(os.path.exists(
-                os.path.join(td, "consolidated_sessions.20260427T123012.csv")))
+                os.path.join(td,
+                    "consolidated_sessions.{0}.csv".format(stamp))))
             self.assertTrue(os.path.exists(
-                os.path.join(td, "summary.20260427T123012.html")))
+                os.path.join(td, "summary.{0}.html".format(stamp))))
 
     def test_archived_consolidated_is_not_loaded_as_input(self):
         """Regression: archived consolidated CSVs share the consolidated schema,
@@ -696,6 +739,8 @@ class TestArchiveExisting(unittest.TestCase):
                 gp.main(["--input-dir", td])
             ts = dt.datetime(2026, 4, 27, 12, 30, 12).timestamp()
             os.utime(os.path.join(td, gp.CONSOLIDATED_CSV), (ts, ts))
+            stamp = dt.datetime.utcfromtimestamp(ts).strftime(
+                "%Y%m%dT%H%M%SZ")
 
             # Second run: should archive the existing consolidated CSV and not
             # try to parse it as a GP export.
@@ -704,7 +749,7 @@ class TestArchiveExisting(unittest.TestCase):
 
             # An archive must exist alongside the fresh output.
             stamped = os.path.join(td,
-                "consolidated_sessions.20260427T123012.csv")
+                "consolidated_sessions.{0}.csv".format(stamp))
             self.assertTrue(os.path.exists(stamped))
 
             # Loading must not pick up the stamped archive as an input.

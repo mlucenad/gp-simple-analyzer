@@ -1274,6 +1274,20 @@ def run_all_rules(sessions, parse_errors, baseline_region, logger):
 # CSV output
 # ============================================================
 
+# Cells starting with these characters can be interpreted as formulas /
+# DDE payloads when the CSV is opened in Excel, LibreOffice, or Google
+# Sheets. Prefixing with a single quote neutralizes the formula while
+# keeping the cell visually identical.
+_CSV_FORMULA_CHARS = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _csv_safe(value):
+    s = "" if value is None else str(value)
+    if s.startswith(_CSV_FORMULA_CHARS):
+        return "'" + s
+    return s
+
+
 def write_consolidated_csv(path, sessions):
     with open(path, "w", encoding="utf-8", newline="") as fh:
         w = csv.writer(fh, quoting=csv.QUOTE_MINIMAL)
@@ -1285,11 +1299,12 @@ def write_consolidated_csv(path, sessions):
                 "Status", "Lifetime (S)", "source_file"]
         w.writerow(cols)
         for s in sessions:
-            w.writerow([s["_id"], s["Domain"], s["User"], s["Primary Username"],
-                        s["Computer"], s["Client"], s["Private IP"],
-                        s["Public IP"], s["Source Region"], s["Tunnel Type"],
-                        s["Login At"], s["Logout At"], s["Status"],
-                        s["Lifetime (S)"], s["_file"]])
+            w.writerow([_csv_safe(v) for v in (
+                s["_id"], s["Domain"], s["User"], s["Primary Username"],
+                s["Computer"], s["Client"], s["Private IP"],
+                s["Public IP"], s["Source Region"], s["Tunnel Type"],
+                s["Login At"], s["Logout At"], s["Status"],
+                s["Lifetime (S)"], s["_file"])])
 
 
 # ============================================================
@@ -1590,8 +1605,8 @@ async function loadPayload() {
     const bin = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
     if (typeof DecompressionStream === 'undefined') {
         throw new Error(
-            'Tu navegador no soporta DecompressionStream. ' +
-            'Usa Chrome 80+, Edge 80+, Safari 16.4+ o Firefox 113+.');
+            'Your browser does not support DecompressionStream. ' +
+            'Use Chrome 80+, Edge 80+, Safari 16.4+, or Firefox 113+.');
     }
     const ds = new DecompressionStream('gzip');
     const stream = new Blob([bin]).stream().pipeThrough(ds);
@@ -1606,10 +1621,14 @@ const state = { data: null, route: '#/' };
 
 function el(tag, attrs, ...children) {
     const e = document.createElement(tag);
+    // Note: there is intentionally no `html:` escape hatch here — every
+    // user-controlled string must flow through createTextNode (children
+    // path below) so the dashboard can never be tricked into evaluating
+    // payload-derived HTML. Add a separate clearly-named helper if raw
+    // HTML insertion is ever genuinely needed.
     if (attrs) for (const k of Object.keys(attrs)) {
         const v = attrs[k];
         if (k === 'class') e.className = v;
-        else if (k === 'html') e.innerHTML = v;
         else if (k.startsWith('on') && typeof v === 'function')
             e.addEventListener(k.slice(2).toLowerCase(), v);
         else if (v !== null && v !== undefined) e.setAttribute(k, v);
@@ -1689,7 +1708,7 @@ function virtualTable(rows, columns, opts) {
     wrap.appendChild(header);
 
     if (rows.length === 0) {
-        wrap.appendChild(el('div', { class: 'tbl-row empty' }, 'Sin resultados.'));
+        wrap.appendChild(el('div', { class: 'tbl-row empty' }, 'No results.'));
         return wrap;
     }
 
@@ -2705,9 +2724,12 @@ window.addEventListener('hashchange', render);
     try {
         state.data = await loadPayload();
     } catch (e) {
-        document.getElementById('app').innerHTML =
-            '<div class="fail-banner"><strong>Could not load data.</strong><br>' +
-            (e.message || e) + '</div>';
+        const app = document.getElementById('app');
+        clear(app);
+        app.appendChild(el('div', { class: 'fail-banner' },
+            el('strong', null, 'Could not load data.'),
+            el('br'),
+            String(e && e.message || e)));
         return;
     }
     render();
@@ -2730,15 +2752,17 @@ def render_html(payload, out_path):
 def archive_existing(path, logger=None):
     """Rename an existing output file to include its mtime stamp.
 
-    Insert a 'YYYYMMDDTHHMMSS' segment between stem and extension, e.g.
-    'summary.html' -> 'summary.20260427T123012.html'. No-op if the file
-    does not exist. Returns the new path on success, or None.
+    Insert a 'YYYYMMDDTHHMMSSZ' UTC segment between stem and extension,
+    e.g. 'summary.html' -> 'summary.20260427T123012Z.html'. UTC keeps the
+    stamp unambiguous when archives are shared across timezones (relevant
+    for incident-response forensics). No-op if the file does not exist.
+    Returns the new path on success, or None.
     """
     if not os.path.exists(path):
         return None
-    mtime = dt.datetime.fromtimestamp(os.path.getmtime(path))
+    mtime = dt.datetime.utcfromtimestamp(os.path.getmtime(path))
     stem, ext = os.path.splitext(path)
-    stamp = mtime.strftime("%Y%m%dT%H%M%S")
+    stamp = mtime.strftime("%Y%m%dT%H%M%SZ")
     target = "{0}.{1}{2}".format(stem, stamp, ext)
     # Disambiguate on the off chance the stamped path already exists
     # (e.g. two runs in the same second on a 1s-resolution filesystem).
